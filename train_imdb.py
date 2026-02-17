@@ -1,18 +1,15 @@
 """
 Train LSTM Sentiment Model on IMDB (Memory-Efficient)
 ======================================================
-Fixes overfitting with: LSTM (not RNN), dropout, weight decay.
-
 Run:
-    tmux new -s train
-    conda activate cs224n-gpu
+    rm -rf data/
     python train_imdb.py
-    Ctrl+B, then D
 """
 
 import os
 import time
 import gc
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -25,10 +22,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 SEQ_LENGTH = 128
 BATCH_SIZE = 32
-HIDDEN_SIZE = 64       # smaller = less overfitting
+HIDDEN_SIZE = 64
 NUM_EPOCHS = 10
-LEARNING_RATE = 0.0005  # lower = more stable
-DROPOUT = 0.5           # regularization
+LEARNING_RATE = 0.0005
+DROPOUT = 0.5
 CHUNK_SIZE = 2500
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,7 +35,7 @@ if DEVICE.type == "cuda":
 
 
 # =============================================================================
-# 1. PRECOMPUTE BERT EMBEDDINGS IN CHUNKS
+# 1. PRECOMPUTE BERT EMBEDDINGS — SHUFFLED BEFORE CHUNKING
 # =============================================================================
 
 def precompute_embeddings(texts, labels, split_name="train"):
@@ -58,15 +55,22 @@ def precompute_embeddings(texts, labels, split_name="train"):
     bert = AutoModel.from_pretrained("bert-base-uncased").to(DEVICE)
     bert.eval()
 
+    # CRITICAL: shuffle data before chunking!
+    # IMDB is sorted: first 12500 positive, then 12500 negative
+    # Without shuffling, each chunk is all one class → model can't learn
+    indices = list(range(len(texts)))
+    random.shuffle(indices)
+    print(f"  Shuffled {len(indices)} samples")
+
     chunk_embs = []
     chunk_labs = []
     chunk_idx = 0
     start = time.time()
 
     with torch.no_grad():
-        for i, text in enumerate(texts):
+        for count, i in enumerate(indices):
             tokens = tokenizer(
-                text, truncation=True, padding="max_length",
+                texts[i], truncation=True, padding="max_length",
                 max_length=SEQ_LENGTH, return_tensors="pt"
             ).to(DEVICE)
             emb = bert(**tokens).last_hidden_state.squeeze(0).cpu().half()
@@ -76,21 +80,25 @@ def precompute_embeddings(texts, labels, split_name="train"):
             if len(chunk_embs) == CHUNK_SIZE:
                 torch.save(torch.stack(chunk_embs), f"{chunk_dir}/emb_{chunk_idx:03d}.pt")
                 torch.save(torch.tensor(chunk_labs, dtype=torch.float), f"{chunk_dir}/lab_{chunk_idx:03d}.pt")
-                print(f"  Saved chunk {chunk_idx} ({(chunk_idx+1)*CHUNK_SIZE}/{len(texts)})")
+                # Verify mix of labels
+                pos = sum(chunk_labs)
+                print(f"  Chunk {chunk_idx}: {int(pos)} pos / {len(chunk_labs)-int(pos)} neg")
                 chunk_embs = []
                 chunk_labs = []
                 chunk_idx += 1
                 gc.collect()
 
-            if i % 500 == 0 and i > 0:
+            if count % 1000 == 0 and count > 0:
                 elapsed = time.time() - start
-                rate = i / elapsed
-                eta = (len(texts) - i) / rate
-                print(f"  {i}/{len(texts)}  ({rate:.0f}/sec, ETA: {eta/60:.1f}min)")
+                rate = count / elapsed
+                eta = (len(texts) - count) / rate
+                print(f"  {count}/{len(texts)}  ({rate:.0f}/sec, ETA: {eta/60:.1f}min)")
 
     if chunk_embs:
         torch.save(torch.stack(chunk_embs), f"{chunk_dir}/emb_{chunk_idx:03d}.pt")
         torch.save(torch.tensor(chunk_labs, dtype=torch.float), f"{chunk_dir}/lab_{chunk_idx:03d}.pt")
+        pos = sum(chunk_labs)
+        print(f"  Chunk {chunk_idx}: {int(pos)} pos / {len(chunk_labs)-int(pos)} neg")
         chunk_idx += 1
 
     with open(done_flag, "w") as f:
@@ -99,54 +107,30 @@ def precompute_embeddings(texts, labels, split_name="train"):
     del bert, tokenizer
     torch.cuda.empty_cache()
     gc.collect()
-    print(f"  Done! {chunk_idx} chunks, {(time.time()-start)/60:.1f}min")
+    print(f"  Done! {chunk_idx} chunks, {(time.time()-start)/60:.1f}min\n")
 
 
 # =============================================================================
-# 2. MODEL — LSTM with Dropout (fixes both problems)
+# 2. MODEL
 # =============================================================================
 
 class SentimentLSTM(nn.Module):
-    """
-    Why LSTM instead of vanilla RNN?
-
-    Vanilla RNN at step 128: gradient has passed through 128 matrix
-    multiplications → vanishes to zero → forgets early tokens.
-
-    LSTM has a "cell state" highway that carries information across
-    all 128 steps without multiplicative degradation.
-
-    Vanilla RNN:  h_t = tanh(W_xh·x + W_hh·h_{t-1})     ← gradient vanishes
-    LSTM:         c_t = f·c_{t-1} + i·candidate           ← gradient flows freely
-                  h_t = o·tanh(c_t)
-    """
     def __init__(self, input_size=768, hidden_size=64, dropout=0.5):
         super().__init__()
-
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             batch_first=True,
-            bidirectional=True   # reads forward AND backward
+            bidirectional=True
         )
-
         self.dropout = nn.Dropout(dropout)
-
-        # bidirectional → hidden size doubles (forward + backward)
         self.fc = nn.Linear(hidden_size * 2, 1)
 
     def forward(self, x):
-        # x: (B, T, 768)
         output, (h_last, c_last) = self.lstm(x)
-        # output: (B, T, hidden*2)  — all time steps
-        # h_last: (2, B, hidden)    — last hidden from each direction
-
-        # Concat forward and backward final hidden states
-        # h_last[0] = forward final, h_last[1] = backward final
-        hidden = torch.cat([h_last[0], h_last[1]], dim=1)  # (B, hidden*2)
-
+        hidden = torch.cat([h_last[0], h_last[1]], dim=1)
         hidden = self.dropout(hidden)
-        return self.fc(hidden)  # (B, 1)
+        return self.fc(hidden)
 
 
 # =============================================================================
@@ -189,40 +173,31 @@ def train():
     n_test = count_chunks("test")
     print(f"Train: {n_train} chunks | Test: {n_test} chunks")
 
-    # --- Model ---
-    model = SentimentLSTM(
-        input_size=768,
-        hidden_size=HIDDEN_SIZE,
-        dropout=DROPOUT
-    ).to(DEVICE)
-
+    model = SentimentLSTM(input_size=768, hidden_size=HIDDEN_SIZE, dropout=DROPOUT).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=1e-4   # L2 regularization
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 
     print(f"\nModel: Bidirectional LSTM + Dropout({DROPOUT})")
     print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Hidden: {HIDDEN_SIZE} | LR: {LEARNING_RATE} | WD: 1e-4")
     print(f"{'='*60}\n")
 
-    # --- TensorBoard ---
-    writer = SummaryWriter("runs/rnn_imdb_lstm")
+    writer = SummaryWriter("runs/lstm_imdb_shuffled")
     os.makedirs("checkpoints", exist_ok=True)
     best_acc = 0.0
     global_step = 0
 
     for epoch in range(NUM_EPOCHS):
-        # --- Train ---
         model.train()
         total_loss = 0
         correct = 0
         total = 0
         start = time.time()
 
-        for chunk_i in range(n_train):
+        # Shuffle chunk order each epoch too
+        chunk_order = list(range(n_train))
+        random.shuffle(chunk_order)
+
+        for chunk_i in chunk_order:
             loader = load_chunk("train", chunk_i)
             for emb, lab in loader:
                 emb, lab = emb.to(DEVICE), lab.to(DEVICE)
@@ -232,7 +207,7 @@ def train():
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # prevent exploding gradients
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
                 total_loss += loss.item()
