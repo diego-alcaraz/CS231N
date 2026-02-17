@@ -1,7 +1,7 @@
 """
-Train RNN Sentiment Model on IMDB (Ultra Memory-Efficient)
-===========================================================
-Loads ONE chunk at a time. Never more than ~1GB in RAM.
+Train LSTM Sentiment Model on IMDB (Memory-Efficient)
+======================================================
+Fixes overfitting with: LSTM (not RNN), dropout, weight decay.
 
 Run:
     tmux new -s train
@@ -25,9 +25,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 SEQ_LENGTH = 128
 BATCH_SIZE = 32
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 64       # smaller = less overfitting
 NUM_EPOCHS = 10
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005  # lower = more stable
+DROPOUT = 0.5           # regularization
 CHUNK_SIZE = 2500
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -37,7 +38,7 @@ if DEVICE.type == "cuda":
 
 
 # =============================================================================
-# 1. PRECOMPUTE BERT EMBEDDINGS IN CHUNKS (float16 to save memory)
+# 1. PRECOMPUTE BERT EMBEDDINGS IN CHUNKS
 # =============================================================================
 
 def precompute_embeddings(texts, labels, split_name="train"):
@@ -68,19 +69,13 @@ def precompute_embeddings(texts, labels, split_name="train"):
                 text, truncation=True, padding="max_length",
                 max_length=SEQ_LENGTH, return_tensors="pt"
             ).to(DEVICE)
-            emb = bert(**tokens).last_hidden_state.squeeze(0).cpu().half()  # float16!
+            emb = bert(**tokens).last_hidden_state.squeeze(0).cpu().half()
             chunk_embs.append(emb)
             chunk_labs.append(labels[i])
 
             if len(chunk_embs) == CHUNK_SIZE:
-                torch.save(
-                    torch.stack(chunk_embs),
-                    f"{chunk_dir}/emb_{chunk_idx:03d}.pt"
-                )
-                torch.save(
-                    torch.tensor(chunk_labs, dtype=torch.float),
-                    f"{chunk_dir}/lab_{chunk_idx:03d}.pt"
-                )
+                torch.save(torch.stack(chunk_embs), f"{chunk_dir}/emb_{chunk_idx:03d}.pt")
+                torch.save(torch.tensor(chunk_labs, dtype=torch.float), f"{chunk_dir}/lab_{chunk_idx:03d}.pt")
                 print(f"  Saved chunk {chunk_idx} ({(chunk_idx+1)*CHUNK_SIZE}/{len(texts)})")
                 chunk_embs = []
                 chunk_labs = []
@@ -108,26 +103,57 @@ def precompute_embeddings(texts, labels, split_name="train"):
 
 
 # =============================================================================
-# 2. MODEL
+# 2. MODEL — LSTM with Dropout (fixes both problems)
 # =============================================================================
 
-class SentimentRNN(nn.Module):
-    def __init__(self, input_size=768, hidden_size=128):
+class SentimentLSTM(nn.Module):
+    """
+    Why LSTM instead of vanilla RNN?
+
+    Vanilla RNN at step 128: gradient has passed through 128 matrix
+    multiplications → vanishes to zero → forgets early tokens.
+
+    LSTM has a "cell state" highway that carries information across
+    all 128 steps without multiplicative degradation.
+
+    Vanilla RNN:  h_t = tanh(W_xh·x + W_hh·h_{t-1})     ← gradient vanishes
+    LSTM:         c_t = f·c_{t-1} + i·candidate           ← gradient flows freely
+                  h_t = o·tanh(c_t)
+    """
+    def __init__(self, input_size=768, hidden_size=64, dropout=0.5):
         super().__init__()
-        self.rnn = nn.RNN(input_size=input_size, hidden_size=hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, 1)
+
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            batch_first=True,
+            bidirectional=True   # reads forward AND backward
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # bidirectional → hidden size doubles (forward + backward)
+        self.fc = nn.Linear(hidden_size * 2, 1)
 
     def forward(self, x):
-        _, h_last = self.rnn(x)
-        return self.fc(h_last.squeeze(0))
+        # x: (B, T, 768)
+        output, (h_last, c_last) = self.lstm(x)
+        # output: (B, T, hidden*2)  — all time steps
+        # h_last: (2, B, hidden)    — last hidden from each direction
+
+        # Concat forward and backward final hidden states
+        # h_last[0] = forward final, h_last[1] = backward final
+        hidden = torch.cat([h_last[0], h_last[1]], dim=1)  # (B, hidden*2)
+
+        hidden = self.dropout(hidden)
+        return self.fc(hidden)  # (B, 1)
 
 
 # =============================================================================
-# 3. LOAD ONE CHUNK → DATALOADER
+# 3. LOAD CHUNKS
 # =============================================================================
 
 def load_chunk(split_name, chunk_idx):
-    """Load a single chunk from disk. Returns DataLoader."""
     chunk_dir = f"data/{split_name}_chunks"
     emb = torch.load(f"{chunk_dir}/emb_{chunk_idx:03d}.pt", map_location="cpu").float()
     lab = torch.load(f"{chunk_dir}/lab_{chunk_idx:03d}.pt", map_location="cpu")
@@ -145,12 +171,11 @@ def count_chunks(split_name):
 # =============================================================================
 
 def train():
-    # --- Precompute if needed ---
-    print("Loading IMDB dataset...")
     train_done = os.path.exists("data/train_done.flag")
     test_done = os.path.exists("data/test_done.flag")
 
     if not train_done or not test_done:
+        print("Loading IMDB dataset...")
         from datasets import load_dataset
         ds = load_dataset("imdb")
         if not train_done:
@@ -160,37 +185,45 @@ def train():
         del ds
         gc.collect()
 
-    n_train_chunks = count_chunks("train")
-    n_test_chunks = count_chunks("test")
-    print(f"Train: {n_train_chunks} chunks | Test: {n_test_chunks} chunks")
+    n_train = count_chunks("train")
+    n_test = count_chunks("test")
+    print(f"Train: {n_train} chunks | Test: {n_test} chunks")
 
     # --- Model ---
-    model = SentimentRNN(input_size=768, hidden_size=HIDDEN_SIZE).to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    model = SentimentLSTM(
+        input_size=768,
+        hidden_size=HIDDEN_SIZE,
+        dropout=DROPOUT
+    ).to(DEVICE)
 
-    print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
-    print(f"Epochs: {NUM_EPOCHS} | Batch: {BATCH_SIZE} | LR: {LEARNING_RATE}")
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=1e-4   # L2 regularization
+    )
+
+    print(f"\nModel: Bidirectional LSTM + Dropout({DROPOUT})")
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Hidden: {HIDDEN_SIZE} | LR: {LEARNING_RATE} | WD: 1e-4")
     print(f"{'='*60}\n")
 
     # --- TensorBoard ---
-    writer = SummaryWriter("runs/rnn_imdb")
+    writer = SummaryWriter("runs/rnn_imdb_lstm")
     os.makedirs("checkpoints", exist_ok=True)
     best_acc = 0.0
     global_step = 0
 
-    # --- Training ---
     for epoch in range(NUM_EPOCHS):
+        # --- Train ---
         model.train()
         total_loss = 0
         correct = 0
         total = 0
         start = time.time()
 
-        # Train: iterate through chunks one at a time
-        for chunk_i in range(n_train_chunks):
+        for chunk_i in range(n_train):
             loader = load_chunk("train", chunk_i)
-
             for emb, lab in loader:
                 emb, lab = emb.to(DEVICE), lab.to(DEVICE)
 
@@ -199,6 +232,7 @@ def train():
 
                 optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # prevent exploding gradients
                 optimizer.step()
 
                 total_loss += loss.item()
@@ -209,25 +243,23 @@ def train():
                 writer.add_scalar("Loss/batch", loss.item(), global_step)
                 global_step += 1
 
-            # Free chunk memory
             del loader
             gc.collect()
 
         avg_loss = total_loss / (total / BATCH_SIZE)
         train_acc = correct / total
-        elapsed = time.time() - start
 
-        writer.add_scalar("Loss/epoch", avg_loss, epoch)
+        writer.add_scalar("Loss/train", avg_loss, epoch)
         writer.add_scalar("Accuracy/train", train_acc, epoch)
 
-        # --- Evaluate: same chunk-by-chunk approach ---
+        # --- Evaluate ---
         model.eval()
         test_correct = 0
         test_total = 0
         test_loss = 0
 
         with torch.no_grad():
-            for chunk_i in range(n_test_chunks):
+            for chunk_i in range(n_test):
                 loader = load_chunk("test", chunk_i)
                 for emb, lab in loader:
                     emb, lab = emb.to(DEVICE), lab.to(DEVICE)
@@ -242,17 +274,18 @@ def train():
 
         test_acc = test_correct / test_total
         test_avg = test_loss / (test_total / BATCH_SIZE)
+        elapsed = time.time() - start
 
         writer.add_scalar("Loss/test", test_avg, epoch)
         writer.add_scalar("Accuracy/test", test_acc, epoch)
 
         print(f"Epoch {epoch+1}/{NUM_EPOCHS} ({elapsed:.1f}s)")
-        print(f"  Train Loss: {avg_loss:.4f} | Train Acc: {train_acc:.4f}")
-        print(f"  Test  Loss: {test_avg:.4f} | Test  Acc: {test_acc:.4f}")
+        print(f"  Train — Loss: {avg_loss:.4f} | Acc: {train_acc:.4f}")
+        print(f"  Test  — Loss: {test_avg:.4f} | Acc: {test_acc:.4f}")
 
         if test_acc > best_acc:
             best_acc = test_acc
-            torch.save(model.state_dict(), "checkpoints/rnn_imdb_best.pt")
+            torch.save(model.state_dict(), "checkpoints/lstm_imdb_best.pt")
             print(f"  ★ New best! ({best_acc:.4f})")
         print()
 
@@ -261,7 +294,7 @@ def train():
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "best_acc": best_acc,
-    }, "checkpoints/rnn_imdb_final.pt")
+    }, "checkpoints/lstm_imdb_final.pt")
 
     writer.close()
     print(f"{'='*60}")
